@@ -25,6 +25,10 @@ PACKAGE_DIR = _resolve(os.environ.get("DEID_PACKAGE_DIR", DATA_DIR / "packages")
 WORKER_INTERVAL = float(os.environ.get("DEID_WORKER_INTERVAL", "1.0"))
 # Reject uploads larger than this (bytes).
 MAX_UPLOAD_BYTES = int(os.environ.get("DEID_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+# Visit rows per streaming segment when building a package. Bounds generation
+# memory (rows + identity lookups live one segment at a time) and sets the
+# granularity of the stale-build check when a newer revision is accepted.
+BUILD_CHUNK_ROWS = int(os.environ.get("DEID_BUILD_CHUNK_ROWS", "2000"))
 
 # Validated identifier pattern: prevents path traversal / header injection.
 _ID_ALLOWED = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")

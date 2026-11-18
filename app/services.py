@@ -1,12 +1,20 @@
 """Transactional services: revision acceptance and package generation."""
 from __future__ import annotations
 
+import itertools
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Iterator
 
 from . import config, deid
-from .csvutil import Row, canonical_hash, parse_csv
+from .csvutil import Row, canonical_hash, iter_parse_csv
 from .database import get_conn, write_lock
+
+log = logging.getLogger("deid.services")
+
+# Identity lookups are batched well below SQLite's variable limit.
+_IDENTITY_QUERY_BATCH = 500
 
 
 class ConflictError(Exception):
@@ -184,14 +192,21 @@ def claim_pending_package() -> tuple[str, str] | None:
 
 
 def finalize_package(cohort_id: str, revision_label: str) -> None:
-    """Build the de-identified package and publish it.
+    """Build the de-identified package segment by segment and publish it.
 
-    The final UPDATE is conditional on the package still being ``generating``
-    and the revision still being current for the cohort. A late build for a
-    revision that was superseded while the worker was busy is discarded
-    instead of overwriting the newer revision's state.
+    The build streams the accepted revision from disk: per segment it looks
+    up only that segment's identities and pushes the de-identified CSV through
+    the zip compressor into a temp file, so memory stays bounded no matter how
+    many visit rows the revision has or how large the cohort's subject history
+    is. Before every segment the build re-checks that its package is still the
+    cohort's current ``generating`` one; if a newer revision was accepted
+    meanwhile, the build stops promptly (freeing the worker queue) and its
+    temp file is removed. The zip is atomically renamed into place only when
+    complete, and the final publish UPDATE is conditional, so a stale or
+    half-written package can never become downloadable.
     """
     conn = get_conn()
+    tmp_path: Path | None = None
     try:
         revision = conn.execute(
             "SELECT * FROM revisions WHERE cohort_id = ? AND revision = ?",
@@ -200,22 +215,45 @@ def finalize_package(cohort_id: str, revision_label: str) -> None:
         if revision is None:
             raise RuntimeError("revision row disappeared")
 
-        identity_rows = conn.execute(
-            "SELECT subject_id, pseudonym, date_shift_days FROM subjects WHERE cohort_id = ?",
+        # Snapshot the cohort subject count for the manifest (same value the
+        # pre-refactor full-identity-map build reported).
+        subject_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM subjects WHERE cohort_id = ?",
             (cohort_id,),
-        ).fetchall()
-        identity = {
-            r["subject_id"]: (r["pseudonym"], r["date_shift_days"]) for r in identity_rows
-        }
-
-        raw = Path(revision["raw_path"]).read_bytes()
-        rows: list[Row] = parse_csv(raw)
-        payload, _manifest = deid.build_package(rows, identity)
+        ).fetchone()["n"]
 
         pkg_dir = config.PACKAGE_DIR / cohort_id
         pkg_dir.mkdir(parents=True, exist_ok=True)
         package_path = pkg_dir / f"rev{revision_label}_deid.zip"
-        deid.write_package_atomic(package_path, payload)
+        tmp_path = package_path.with_name(package_path.name + ".tmp")
+
+        stats = {"rows": 0}
+
+        def ensure_current() -> None:
+            if not _is_current_generating(conn, cohort_id, revision_label):
+                raise StaleRevisionError(
+                    f"修订 {revision_label} 已被更新的修订取代，生成任务提前停止"
+                )
+
+        ensure_current()
+        rows = iter_parse_csv(revision["raw_path"])
+        try:
+            segments = _deidentified_segments(conn, cohort_id, rows, stats, ensure_current)
+            deid.write_package_streaming(
+                tmp_path,
+                segments,
+                lambda: deid.build_manifest(stats["rows"], subject_count),
+            )
+        finally:
+            rows.close()
+
+        # Zip complete: atomically move into place, then publish. The UPDATE
+        # is conditional on the package still being ``generating`` and the
+        # revision still being current for the cohort. A late build for a
+        # revision that was superseded while the worker was busy is discarded
+        # instead of overwriting the newer revision's state.
+        tmp_path.replace(package_path)
+        tmp_path = None  # renamed away; nothing left to clean up on failure
 
         now = _utcnow()
         with write_lock:
@@ -246,7 +284,95 @@ def finalize_package(cohort_id: str, revision_label: str) -> None:
                     f"{state['status'] if state else 'missing'})"
                 )
     finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
         conn.close()
+
+
+def _is_current_generating(conn, cohort_id: str, revision_label: str) -> bool:
+    """True while the package may keep building: still ``generating`` and its
+    revision is still the cohort's current one. Turns false as soon as a newer
+    revision is accepted (the accept transaction supersedes this package)."""
+    row = conn.execute(
+        """
+        SELECT 1 FROM packages
+         WHERE cohort_id = ? AND revision = ? AND status = 'generating'
+           AND revision = (SELECT current_revision FROM cohorts WHERE cohort_id = ?)
+        """,
+        (cohort_id, revision_label, cohort_id),
+    ).fetchone()
+    return row is not None
+
+
+def _identity_for_subjects(conn, cohort_id: str, subject_ids: set[str]) -> dict[str, tuple[str, int]]:
+    """Fetch pseudonym/shift pairs for one segment's subjects in batched
+    point queries, instead of materialising the cohort's whole identity map."""
+    identity: dict[str, tuple[str, int]] = {}
+    ids = sorted(subject_ids)
+    for i in range(0, len(ids), _IDENTITY_QUERY_BATCH):
+        batch = ids[i : i + _IDENTITY_QUERY_BATCH]
+        placeholders = ", ".join("?" for _ in batch)
+        for row in conn.execute(
+            "SELECT subject_id, pseudonym, date_shift_days FROM subjects "
+            f"WHERE cohort_id = ? AND subject_id IN ({placeholders})",
+            (cohort_id, *batch),
+        ):
+            identity[row["subject_id"]] = (row["pseudonym"], row["date_shift_days"])
+    return identity
+
+
+def _deidentified_segments(
+    conn,
+    cohort_id: str,
+    rows: Iterator[Row],
+    stats: dict,
+    ensure_current: Callable[[], None],
+) -> Iterator[bytes]:
+    """Yield encoded CSV segments (header first, rows in upload order).
+
+    Each segment covers ``config.BUILD_CHUNK_ROWS`` parsed rows: only that
+    segment's rows and identities are held in memory at any time. The
+    staleness check runs before every segment, so a build is abandoned within
+    one segment once a newer revision is accepted.
+    """
+    chunk_size = max(1, int(config.BUILD_CHUNK_ROWS))
+    first = True
+    while True:
+        chunk = list(itertools.islice(rows, chunk_size))
+        if not chunk:
+            return
+        ensure_current()
+        identity = _identity_for_subjects(conn, cohort_id, {r.subject_id for r in chunk})
+        parts = [deid.CSV_HEADER] if first else []
+        first = False
+        for row in chunk:
+            mapping = identity.get(row.subject_id)
+            if mapping is None:
+                raise RuntimeError("数据不一致：修订包含未登记的受试者")
+            parts.append(deid.format_csv_line(row, mapping[0], mapping[1]))
+        stats["rows"] += len(chunk)
+        yield "".join(parts).encode("utf-8")
+
+
+def cleanup_orphan_tmp_files() -> int:
+    """Delete streaming temp files left behind by interrupted builds.
+
+    Runs at startup together with the database recovery: a crash mid-build
+    can leave ``*.zip.tmp`` files that are never referenced by the database
+    and never downloadable; removing them is safe because the affected
+    package is rebuilt from the stored raw revision.
+    """
+    removed = 0
+    pkg_root = config.PACKAGE_DIR
+    if not pkg_root.is_dir():
+        return 0
+    for tmp in pkg_root.rglob("*.zip.tmp"):
+        try:
+            tmp.unlink()
+            removed += 1
+        except OSError:
+            log.warning("could not remove orphan temp package file: %s", tmp)
+    return removed
 
 
 def mark_failed(cohort_id: str, revision_label: str, error: str) -> None:

@@ -6,6 +6,14 @@ an English or a Chinese template:
 
     subject_id, visit_date, value
     受试者号, 访视日期, 测值
+
+Two entry points share exactly the same validation rules:
+
+* :func:`parse_csv` validates an in-memory upload and returns all rows; it is
+  used once at acceptance time.
+* :func:`iter_parse_csv` streams an already accepted revision from disk one
+  row at a time; it is used at package-generation time so build memory does
+  not grow with the number of visit rows.
 """
 from __future__ import annotations
 
@@ -13,8 +21,10 @@ import csv
 import hashlib
 import io
 import math
+import os
 from dataclasses import dataclass
 from datetime import date
+from typing import Iterator
 
 HEADER_ALIASES = {
     "subject_id": {"subject_id", "subjectid", "受试者号", "受试者编号"},
@@ -60,21 +70,16 @@ def _map_headers(fieldnames: list[str]) -> dict[str, int]:
     return mapping
 
 
-def parse_csv(content: bytes) -> list[Row]:
-    """Parse and validate a complete revision payload."""
-    try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise CSVValidationError("文件必须是 UTF-8 编码的 CSV") from exc
-
-    reader = csv.reader(io.StringIO(text))
+def _read_header(reader) -> dict[str, int]:
     try:
         header = next(reader)
     except StopIteration:
         raise CSVValidationError("CSV 为空，缺少表头")
+    return _map_headers(header)
 
-    mapping = _map_headers(header)
-    rows: list[Row] = []
+
+def _validated_rows(reader, mapping: dict[str, int]) -> Iterator[Row]:
+    """Yield validated rows one at a time; the single source of row rules."""
     for line_no, raw_row in enumerate(reader, start=2):
         if not raw_row or all((cell or "").strip() == "" for cell in raw_row):
             continue  # tolerate trailing blank lines
@@ -105,11 +110,48 @@ def parse_csv(content: bytes) -> list[Row]:
         if not math.isfinite(value):
             raise CSVValidationError(f"第 {line_no} 行测值必须是有限数字: {value_text!r}")
 
-        rows.append(Row(subject_id=subject_id, visit_date=visit_date, value=value))
+        yield Row(subject_id=subject_id, visit_date=visit_date, value=value)
 
+
+def parse_csv(content: bytes) -> list[Row]:
+    """Parse and validate a complete revision payload."""
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CSVValidationError("文件必须是 UTF-8 编码的 CSV") from exc
+
+    reader = csv.reader(io.StringIO(text))
+    mapping = _read_header(reader)
+    rows = list(_validated_rows(reader, mapping))
     if not rows:
         raise CSVValidationError("CSV 不包含任何数据行，不能作为完整修订受理")
     return rows
+
+
+def iter_parse_csv(path: str | os.PathLike[str]) -> Iterator[Row]:
+    """Stream rows from an accepted revision file, one at a time.
+
+    Applies exactly the same validation as :func:`parse_csv` but keeps memory
+    O(1) in the number of rows, which lets package generation process
+    arbitrarily large revisions in bounded memory. The file handle is closed
+    when the generator is exhausted or explicitly closed.
+    """
+    fh = open(path, "rb")
+    try:
+        stream = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
+        reader = csv.reader(stream)
+        try:
+            mapping = _read_header(reader)
+            produced = 0
+            for row in _validated_rows(reader, mapping):
+                produced += 1
+                yield row
+            if produced == 0:
+                raise CSVValidationError("CSV 不包含任何数据行，不能作为完整修订受理")
+        except UnicodeDecodeError as exc:
+            raise CSVValidationError("文件必须是 UTF-8 编码的 CSV") from exc
+    finally:
+        fh.close()
 
 
 def canonical_hash(rows: list[Row]) -> str:

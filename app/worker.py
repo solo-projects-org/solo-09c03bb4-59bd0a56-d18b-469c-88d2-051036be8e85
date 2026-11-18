@@ -3,7 +3,11 @@
 A single daemon thread polls the database. Builds run one at a time, but a
 slow or failing build for one cohort only blocks the queue, never the HTTP
 download endpoint: other cohorts' already published packages remain
-downloadable throughout.
+downloadable throughout. A build streams its revision in segments and
+re-checks per segment that it is still current, so a newly accepted revision
+preempts the running build within one segment instead of waiting for it to
+finish; the preempted build raises :class:`StaleRevisionError` and the worker
+moves on to the newer package immediately.
 """
 from __future__ import annotations
 

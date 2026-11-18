@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .csvutil import CSVValidationError, parse_csv
 from .database import get_conn, init_db, reset_interrupted_packages
-from .services import ConflictError, accept_revision
+from .services import ConflictError, accept_revision, cleanup_orphan_tmp_files
 from .worker import PackageWorker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -29,6 +29,9 @@ async def lifespan(_app: FastAPI):
     recovered = reset_interrupted_packages()
     if recovered:
         log.info("startup recovery: %d interrupted package(s) back to pending", recovered)
+    removed = cleanup_orphan_tmp_files()
+    if removed:
+        log.info("startup cleanup: removed %d orphaned temp package file(s)", removed)
     worker.start()
     try:
         yield
